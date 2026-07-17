@@ -66,35 +66,35 @@ def _sentence_aggregator() -> SimpleTextAggregator:
 
 
 class TestRegisterSkipped(unittest.IsolatedAsyncioTestCase):
-    def test_emits_immediately_with_empty_queue(self):
+    async def test_emits_immediately_with_empty_queue(self):
         seq = _seq()
         frame = _skipped_frame("code block")
-        result = seq.register_skipped(frame, "ctx1", None)
+        result = await seq.register_skipped(frame, "ctx1", None)
         self.assertEqual(len(result), 1)
         self.assertIs(result[0], frame)
 
-    def test_sets_append_to_context_true(self):
+    async def test_sets_append_to_context_true(self):
         seq = _seq()
         frame = _skipped_frame("code")
-        seq.register_skipped(frame, "ctx1", None)
+        await seq.register_skipped(frame, "ctx1", None)
         self.assertTrue(frame.append_to_context)
 
-    def test_sets_context_id_on_frame(self):
+    async def test_sets_context_id_on_frame(self):
         seq = _seq()
         frame = _skipped_frame("code")
-        seq.register_skipped(frame, "ctx42", None)
+        await seq.register_skipped(frame, "ctx42", None)
         self.assertEqual(frame.context_id, "ctx42")
 
-    def test_sets_transport_destination(self):
+    async def test_sets_transport_destination(self):
         seq = _seq()
         frame = _skipped_frame("code")
-        result = seq.register_skipped(frame, "ctx1", "dest-A")
+        result = await seq.register_skipped(frame, "ctx1", "dest-A")
         self.assertEqual(result[0].transport_destination, "dest-A")
 
     async def test_blocked_by_incomplete_spoken_slot(self):
         seq = _seq()
         await seq.register_spoken(_spoken_frame("hello world"), "ctx1", "hello world", True)
-        result = seq.register_skipped(_skipped_frame("code"), "ctx2", None)
+        result = await seq.register_skipped(_skipped_frame("code"), "ctx2", None)
         self.assertEqual(result, [])
 
     async def test_emits_immediately_after_already_complete_spoken_slot(self):
@@ -103,13 +103,13 @@ class TestRegisterSkipped(unittest.IsolatedAsyncioTestCase):
             _spoken_frame("hi"), "ctx1", "hi", append_to_context=True, build_tracker=False
         )
         seq.complete_spoken_slot()
-        result = seq.register_skipped(_skipped_frame("code"), "ctx2", None)
+        result = await seq.register_skipped(_skipped_frame("code"), "ctx2", None)
         self.assertEqual(len(result), 1)
 
-    def test_multiple_skipped_before_any_spoken_all_emit(self):
+    async def test_multiple_skipped_before_any_spoken_all_emit(self):
         seq = _seq()
-        r1 = seq.register_skipped(_skipped_frame("code1"), "ctx1", None)
-        r2 = seq.register_skipped(_skipped_frame("code2"), "ctx2", None)
+        r1 = await seq.register_skipped(_skipped_frame("code1"), "ctx1", None)
+        r2 = await seq.register_skipped(_skipped_frame("code2"), "ctx2", None)
         self.assertEqual(len(r1), 1)
         self.assertEqual(len(r2), 1)
 
@@ -130,7 +130,7 @@ class TestCompleteSpokenSlot(unittest.IsolatedAsyncioTestCase):
             _spoken_frame("hello"), "ctx1", "hello", append_to_context=True, build_tracker=False
         )
         skipped = _skipped_frame("code")
-        seq.register_skipped(skipped, "ctx2", None)  # blocked
+        await seq.register_skipped(skipped, "ctx2", None)  # blocked
 
         result = seq.complete_spoken_slot()
         self.assertEqual(len(result), 1)
@@ -146,7 +146,7 @@ class TestCompleteSpokenSlot(unittest.IsolatedAsyncioTestCase):
             _spoken_frame("two"), "ctx2", "two", append_to_context=True, build_tracker=False
         )
         skipped = _skipped_frame("code")
-        seq.register_skipped(skipped, "ctx3", None)
+        await seq.register_skipped(skipped, "ctx3", None)
 
         # ctx2 still blocks the skipped frame
         result = seq.complete_spoken_slot()
@@ -161,7 +161,7 @@ class TestCompleteSpokenSlot(unittest.IsolatedAsyncioTestCase):
             _spoken_frame("two"), "ctx2", "two", append_to_context=True, build_tracker=False
         )
         skipped = _skipped_frame("code")
-        seq.register_skipped(skipped, "ctx3", None)
+        await seq.register_skipped(skipped, "ctx3", None)
 
         seq.complete_spoken_slot()  # completes ctx1
         result = seq.complete_spoken_slot()  # completes ctx2 → flush skipped
@@ -183,14 +183,14 @@ class TestFlush(unittest.IsolatedAsyncioTestCase):
         await seq.register_spoken(
             _spoken_frame("hello"), "ctx1", "hello", append_to_context=True, build_tracker=False
         )
-        seq.register_skipped(_skipped_frame("code"), "ctx2", None)
+        await seq.register_skipped(_skipped_frame("code"), "ctx2", None)
         self.assertEqual(seq.flush(), [])
 
     async def test_last_word_pts_assigned_to_skipped_frame(self):
         seq = _seq()
         await seq.register_spoken(_spoken_frame("hello"), "ctx1", "hello", True)
         skipped = _skipped_frame("code")
-        seq.register_skipped(skipped, "ctx2", None)
+        await seq.register_skipped(skipped, "ctx2", None)
 
         # process_word("hello") completes the spoken slot and calls flush(last_word_pts=77)
         result = seq.process_word("hello", pts=77, context_id="ctx1")
@@ -249,7 +249,7 @@ class TestProcessWordBasic(unittest.IsolatedAsyncioTestCase):
 
     async def test_non_completing_word_does_not_flush_skipped(self):
         seq = await self._seq_with_spoken("hello world")
-        seq.register_skipped(_skipped_frame("code"), "ctx2", None)
+        await seq.register_skipped(_skipped_frame("code"), "ctx2", None)
         result = seq.process_word("hello", pts=10, context_id="ctx1")
         self.assertEqual(len(result), 2)
         self.assertIsInstance(result[0], TTSTextFrame)
@@ -258,7 +258,7 @@ class TestProcessWordBasic(unittest.IsolatedAsyncioTestCase):
     async def test_completing_word_flushes_blocked_skipped_frame(self):
         seq = await self._seq_with_spoken("hello")
         skipped = _skipped_frame("code")
-        seq.register_skipped(skipped, "ctx2", None)
+        await seq.register_skipped(skipped, "ctx2", None)
         result = seq.process_word("hello", pts=50, context_id="ctx1")
         self.assertEqual(len(result), 3)
         self.assertIsInstance(result[0], TTSTextFrame)
@@ -268,7 +268,7 @@ class TestProcessWordBasic(unittest.IsolatedAsyncioTestCase):
     async def test_last_of_multiple_words_flushes_skipped(self):
         seq = await self._seq_with_spoken("hello world")
         skipped = _skipped_frame("code")
-        seq.register_skipped(skipped, "ctx2", None)
+        await seq.register_skipped(skipped, "ctx2", None)
         seq.process_word("hello", pts=10, context_id="ctx1")
         result = seq.process_word("world", pts=20, context_id="ctx1")
         self.assertTrue(any(f is skipped for f in result))
@@ -364,7 +364,7 @@ class TestProcessWordOverflow(unittest.IsolatedAsyncioTestCase):
         await seq.register_spoken(_spoken_frame("abc"), "ctx1", "abc", True)
         await seq.register_spoken(_spoken_frame("def"), "ctx2", "def", True)
         skipped = _skipped_frame("code")
-        seq.register_skipped(skipped, "ctx3", None)  # blocked behind ctx2
+        await seq.register_skipped(skipped, "ctx3", None)  # blocked behind ctx2
 
         result = seq.process_word("abcdef", pts=100, context_id="ctx1")
         self.assertTrue(any(f is skipped for f in result))
@@ -374,7 +374,7 @@ class TestProcessWordOverflow(unittest.IsolatedAsyncioTestCase):
         await seq.register_spoken(_spoken_frame("abc"), "ctx1", "abc", True)
         await seq.register_spoken(_spoken_frame("def ghi"), "ctx2", "def ghi", True)
         skipped = _skipped_frame("code")
-        seq.register_skipped(skipped, "ctx3", None)
+        await seq.register_skipped(skipped, "ctx3", None)
 
         # "abcdef" overflows: "def" goes to ctx2, but ctx2 still expects " ghi"
         result = seq.process_word("abcdef", pts=100, context_id="ctx1")
@@ -405,7 +405,7 @@ class TestProcessWordForcesComplete(unittest.IsolatedAsyncioTestCase):
         await seq.register_spoken(_spoken_frame("hello"), "ctx1", "hello", True)
         await seq.register_spoken(_spoken_frame("world"), "ctx2", "world", True)
         skipped = _skipped_frame("code")
-        seq.register_skipped(skipped, "ctx3", None)
+        await seq.register_skipped(skipped, "ctx3", None)
 
         # "world" force-completes ctx1 and completes ctx2 via overflow
         result = seq.process_word("world", pts=50, context_id="ctx2")
@@ -467,7 +467,7 @@ class TestForceComplete(unittest.IsolatedAsyncioTestCase):
         seq = _seq()
         await seq.register_spoken(_spoken_frame("hello"), "ctx1", "hello", True)
         skipped = _skipped_frame("code")
-        seq.register_skipped(skipped, "ctx2", None)
+        await seq.register_skipped(skipped, "ctx2", None)
 
         result = seq.force_complete(last_word_pts=20)
         self.assertTrue(any(f is skipped for f in result))
@@ -510,7 +510,7 @@ class TestForceComplete(unittest.IsolatedAsyncioTestCase):
             _spoken_frame("hello"), "ctx1", "hello", append_to_context=True, build_tracker=False
         )
         skipped = _skipped_frame("code")
-        seq.register_skipped(skipped, "ctx2", None)
+        await seq.register_skipped(skipped, "ctx2", None)
 
         result = seq.force_complete(last_word_pts=0)
         tts_frames = [f for f in result if isinstance(f, TTSTextFrame)]
@@ -538,7 +538,7 @@ class TestClear(unittest.IsolatedAsyncioTestCase):
     async def test_clears_slots(self):
         seq = _seq()
         await seq.register_spoken(_spoken_frame("hello"), "ctx1", "hello", True)
-        seq.register_skipped(_skipped_frame("code"), "ctx2", None)
+        await seq.register_skipped(_skipped_frame("code"), "ctx2", None)
         seq.clear()
         self.assertEqual(seq._slots, [])
 
@@ -553,7 +553,7 @@ class TestClear(unittest.IsolatedAsyncioTestCase):
         await seq.register_spoken(_spoken_frame("hello"), "ctx1", "hello", True)
         seq.clear()
         frame = _skipped_frame("code")
-        result = seq.register_skipped(frame, "ctx2", None)
+        result = await seq.register_skipped(frame, "ctx2", None)
         self.assertEqual(len(result), 1)
 
     async def test_after_clear_process_word_drops_stale_word(self):
@@ -610,7 +610,7 @@ class TestCJKLanguages(unittest.IsolatedAsyncioTestCase):
         words = ["저는", "여러분의", "AI", "어시스턴트입니다."]
         await seq.register_spoken(_spoken_frame(sentence), "ctx1", sentence, True)
         skipped = _skipped_frame("[code]")
-        seq.register_skipped(skipped, "ctx2", None)
+        await seq.register_skipped(skipped, "ctx2", None)
 
         # Skipped stays blocked until the last word arrives
         for word in words[:-1]:
@@ -641,7 +641,7 @@ class TestCJKLanguages(unittest.IsolatedAsyncioTestCase):
         sentence = "こんにちは、私はあなたの"
         await seq.register_spoken(_spoken_frame(sentence), "ctx1", sentence, True)
         skipped = _skipped_frame("[skipped]")
-        seq.register_skipped(skipped, "ctx2", None)
+        await seq.register_skipped(skipped, "ctx2", None)
 
         r1 = seq.process_word("こんにちは、私", pts=100, context_id="ctx1")
         self.assertFalse(any(f is skipped for f in r1))
@@ -669,7 +669,7 @@ class TestCJKLanguages(unittest.IsolatedAsyncioTestCase):
         sentence = "你好，我是你的智能"
         await seq.register_spoken(_spoken_frame(sentence), "ctx1", sentence, True)
         skipped = _skipped_frame("[skipped]")
-        seq.register_skipped(skipped, "ctx2", None)
+        await seq.register_skipped(skipped, "ctx2", None)
 
         r1 = seq.process_word("你好，我是", pts=100, context_id="ctx1")
         self.assertFalse(any(f is skipped for f in r1))
@@ -1404,7 +1404,7 @@ class TestRegisterSkippedForcesFinalize(unittest.IsolatedAsyncioTestCase):
             text_aggregator=_sentence_aggregator(),
         )
         skipped = _skipped_frame("code")
-        seq.register_skipped(skipped, "ctx2", None)
+        await seq.register_skipped(skipped, "ctx2", None)
 
         self.assertEqual(len(seq._slots), 2)
         self.assertTrue(seq._slots[0].spoken)
@@ -1412,10 +1412,10 @@ class TestRegisterSkippedForcesFinalize(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(seq._slots[1].spoken)
         self.assertIs(seq._slots[1].frame, skipped)
 
-    def test_register_skipped_with_nothing_pending_behaves_as_today(self):
+    async def test_register_skipped_with_nothing_pending_behaves_as_today(self):
         seq = _seq(streaming=True)
         frame = _skipped_frame("code")
-        result = seq.register_skipped(frame, "ctx1", None)
+        result = await seq.register_skipped(frame, "ctx1", None)
         self.assertEqual(len(result), 1)
         self.assertIs(result[0], frame)
 
@@ -1429,7 +1429,7 @@ class TestRegisterSkippedForcesFinalize(unittest.IsolatedAsyncioTestCase):
             text_aggregator=_sentence_aggregator(),
         )
         skipped = _skipped_frame("code")
-        result = seq.register_skipped(skipped, "ctx1", None)
+        result = await seq.register_skipped(skipped, "ctx1", None)
         self.assertEqual(result, [])
 
         result = seq.process_word("Hi there", pts=10, context_id="ctx1")

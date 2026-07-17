@@ -728,7 +728,7 @@ class TTSService(AIService):
             # Force-promote any sentence still pending in the sequencer (streaming
             # mode only; a no-op otherwise) — handles a response that ends with no
             # terminal punctuation.
-            for f in self._aggregated_frame_sequencer.finalize():
+            for f in await self._aggregated_frame_sequencer.finalize():
                 await self.push_frame(f)
 
             # We pause processing incoming frames if the LLM response included
@@ -990,7 +990,7 @@ class TTSService(AIService):
     ):
         # Enqueue the skipped frame; returns it immediately if no spoken slot
         # precedes it, or holds it until the sequencer can flush it in order.
-        for f in self._aggregated_frame_sequencer.register_skipped(
+        for f in await self._aggregated_frame_sequencer.register_skipped(
             frame, context_id, self._transport_destination
         ):
             await self.push_frame(f)
@@ -1122,8 +1122,6 @@ class TTSService(AIService):
             prepared_text,
             append_to_context=self._tts_contexts[context_id].append_to_context,
             build_tracker=not self._push_text_frames,
-            text_aggregator=self._text_aggregator,
-            includes_inter_frame_spaces=bool(includes_inter_frame_spaces),
         ):
             await self.push_frame(f)
 
