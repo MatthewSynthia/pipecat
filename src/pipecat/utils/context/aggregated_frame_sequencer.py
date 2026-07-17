@@ -255,8 +255,7 @@ class AggregatedFrameSequencer:
         # path below. A word for the context currently streaming a pending sentence
         # (no slot promoted yet) is not stale — it's handled by the buffering below.
         is_current_streaming_ctx = (
-            self._streaming_slot_meta is not None
-            and context_id == self._streaming_slot_meta[0]
+            self._streaming_slot_meta is not None and context_id == self._streaming_slot_meta[0]
         )
         if (
             context_id is not None
@@ -444,9 +443,7 @@ class AggregatedFrameSequencer:
         self._buffered_words.clear()
         self._streaming_slot_meta = None
         # Re-create the aggregator for a clean state (sync; avoids an async reset).
-        self._parallel_text_aggregator = (
-            ParallelTextAggregator() if self._streaming else None
-        )
+        self._parallel_text_aggregator = ParallelTextAggregator() if self._streaming else None
 
     # -------------------------------------------------------------------------
     # Internal helpers

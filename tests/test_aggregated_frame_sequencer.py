@@ -1156,140 +1156,96 @@ class TestVoiceFormattingTransforms(unittest.IsolatedAsyncioTestCase):
 
 # ---------------------------------------------------------------------------
 # register_spoken — streaming (TOKEN mode): token-by-token sentence accumulation
+#
+# In streaming mode the sequencer owns a ParallelTextAggregator; register_spoken
+# is called once per token and only registers a real slot once a sentence
+# boundary is confirmed (which happens when the NEXT sentence's first token
+# arrives, or via finalize() at end of turn).
 # ---------------------------------------------------------------------------
 
 
+async def _stream(seq, ctx, *tokens):
+    """Feed same-text tokens through streaming register_spoken; return pushed frames."""
+    frames = []
+    for t in tokens:
+        frames += await seq.register_spoken(_spoken_frame(t), ctx, t, append_to_context=True)
+    return frames
+
+
 class TestRegisterSpokenStreaming(unittest.IsolatedAsyncioTestCase):
-    async def test_non_terminal_token_does_not_promote(self):
+    async def test_non_terminal_tokens_do_not_promote(self):
         seq = _seq(streaming=True)
-        result = await seq.register_spoken(
-            _spoken_frame("Hi"),
-            "ctx1",
-            "Hi",
-            append_to_context=True,
-            text_aggregator=_sentence_aggregator(),
-        )
-        self.assertEqual(result, [])
+        await _stream(seq, "ctx1", "Hi", " there")
         self.assertEqual(seq._slots, [])
 
-    async def test_sentence_boundary_promotes_a_real_slot(self):
+    async def test_terminal_token_alone_does_not_promote(self):
+        # Needs the next sentence's lookahead token before the boundary confirms.
         seq = _seq(streaming=True)
-        agg = _sentence_aggregator()
-        await seq.register_spoken(
-            _spoken_frame("Hi"), "ctx1", "Hi", append_to_context=True, text_aggregator=agg
-        )
-        await seq.register_spoken(
-            _spoken_frame("."), "ctx1", ".", append_to_context=True, text_aggregator=agg
-        )
-        # The token that resolves the lookahead promotes the *whole* accumulated
-        # buffer as one combined unit (whole-token-granularity promotion), even
-        # though NLTK itself would place the boundary right after "Hi.".
-        result = await seq.register_spoken(
-            _spoken_frame(" Bye"), "ctx1", " Bye", append_to_context=True, text_aggregator=agg
-        )
-        self.assertEqual(result, [])
+        await _stream(seq, "ctx1", "Hi", " there", "!")
+        self.assertEqual(seq._slots, [])
+
+    async def test_next_sentence_token_promotes_clean_first_sentence(self):
+        seq = _seq(streaming=True)
+        # The lookahead token " How" confirms "Hi there!" but is NOT folded in.
+        await _stream(seq, "ctx1", "Hi", " there", "!", " How")
         self.assertEqual(len(seq._slots), 1)
         slot = seq._slots[0]
         self.assertIsNotNone(slot.tracker)
         self.assertEqual(slot.frame.aggregated_by, AggregationType.SENTENCE)
-        self.assertEqual(slot.frame.text, "Hi. Bye")
+        self.assertEqual(slot.frame.text, "Hi there!")
 
     async def test_promoted_slot_processes_words_normally(self):
         seq = _seq(streaming=True)
-        agg = _sentence_aggregator()
-        await seq.register_spoken(
-            _spoken_frame("Hi"), "ctx1", "Hi", append_to_context=True, text_aggregator=agg
-        )
-        # A trailing non-whitespace char after the period is needed to resolve
-        # the sentence-boundary lookahead (disambiguates from e.g. "$29.").
-        await seq.register_spoken(
-            _spoken_frame(". Ok"), "ctx1", ". Ok", append_to_context=True, text_aggregator=agg
-        )
-
-        # The whole accumulated buffer promotes as one combined sentence, even
-        # though NLTK itself would split "Hi. Ok" into two — see the
-        # whole-token-granularity note on register_spoken.
-        result = seq.process_word("Hi. Ok", pts=100, context_id="ctx1")
+        await _stream(seq, "ctx1", "Hi", " there", "!", " How")  # promotes "Hi there!"
+        result = seq.process_word("Hi", pts=10, context_id="ctx1")
+        result += seq.process_word("there!", pts=20, context_id="ctx1")
         word_frames = [f for f in result if isinstance(f, TTSTextFrame)]
         progress = [f for f in result if isinstance(f, AggregatedTextProgressFrame)]
-        self.assertEqual(len(word_frames), 1)
-        self.assertEqual(word_frames[0].text, "Hi. Ok")
-        self.assertEqual(len(progress), 1)
-        self.assertEqual(progress[0].accumulated_text, "Hi. Ok")
-        self.assertEqual(progress[0].remaining_text, "")
-        self.assertEqual(seq._slots, [])
+        self.assertEqual([f.text for f in word_frames], ["Hi", "there!"])
+        self.assertEqual(progress[-1].accumulated_text, "Hi there!")
+        self.assertEqual(progress[-1].remaining_text, "")
 
-    async def test_boundary_detection_respects_skip_tags(self):
-        """A SkipTagsAggregator clone must not confirm a boundary inside a skipped tag."""
+    async def test_slot_ifs_not_set_from_streaming_path(self):
+        # The spacing bug: LLM tokens carry includes_inter_frame_spaces=True, but
+        # that must NOT propagate to the promoted slot / word frames — English
+        # word timestamps must still be joined with spaces in the context.
         seq = _seq(streaming=True)
-        agg = SkipTagsAggregator(
-            tags=[("<spell>", "</spell>")], aggregation_type=AggregationType.TOKEN
-        )
+        await _stream(seq, "ctx1", "Hi", " there", "!", " How")
+        self.assertFalse(seq._slots[0].includes_inter_frame_spaces)
+        r1 = seq.process_word("Hi", pts=10, context_id="ctx1")
+        r2 = seq.process_word("there!", pts=20, context_id="ctx1")
+        parts = [
+            TextPartForConcatenation(
+                f.text, includes_inter_part_spaces=f.includes_inter_frame_spaces
+            )
+            for f in r1 + r2
+            if isinstance(f, TTSTextFrame)
+        ]
+        self.assertEqual(concatenate_aggregated_text(parts), "Hi there!")
 
-        r1 = await seq.register_spoken(
-            _spoken_frame("<spell>"), "ctx1", "<spell>", append_to_context=True, text_aggregator=agg
-        )
-        r2 = await seq.register_spoken(
-            _spoken_frame("A. B."), "ctx1", "A. B.", append_to_context=True
-        )
-        # Still inside the tag — no boundary should be confirmed despite the periods.
-        self.assertEqual(r1, [])
-        self.assertEqual(r2, [])
-        self.assertEqual(seq._slots, [])
-
-        # Trailing "Next" supplies the lookahead char needed to confirm the
-        # boundary within this same call (sentence detection holds a trailing
-        # period until it sees the following non-whitespace character).
-        r3 = await seq.register_spoken(
-            _spoken_frame("</spell> Bye. Next"),
-            "ctx1",
-            "</spell> Bye. Next",
-            append_to_context=True,
-        )
-        self.assertEqual(len(seq._slots), 1)
-        self.assertEqual(r3, [])
-
-    async def test_cjk_tokens_join_without_space(self):
+    async def test_multi_sentence_promotes_each_cleanly(self):
         seq = _seq(streaming=True)
-        agg = _sentence_aggregator()
-        await seq.register_spoken(
-            _spoken_frame("こんにちは"),
-            "ctx1",
-            "こんにちは",
-            append_to_context=True,
-            text_aggregator=agg,
-            includes_inter_frame_spaces=True,
-        )
-        # Trailing content after "。" resolves the sentence-boundary lookahead.
-        await seq.register_spoken(
-            _spoken_frame("。気"),
-            "ctx1",
-            "。気",
-            append_to_context=True,
-            includes_inter_frame_spaces=True,
-        )
-        self.assertEqual(len(seq._slots), 1)
-        self.assertEqual(seq._slots[0].frame.text, "こんにちは。気")
+        # Two sentences streamed; the first promotes when the second starts.
+        await _stream(seq, "ctx1", "Hi", " there", "!", " How", " are", " you", "?")
+        self.assertEqual([s.frame.text for s in seq._slots], ["Hi there!"])
+        # The trailing sentence promotes on finalize.
+        await seq.finalize()
+        self.assertEqual([s.frame.text for s in seq._slots], ["Hi there!", " How are you?"])
 
     async def test_transformed_tts_text_preserved_through_promotion(self):
-        """tts_text differing from the token's own text (a simulated transform) survives promotion."""
         seq = _seq(streaming=True)
-        agg = _sentence_aggregator()
-        await seq.register_spoken(
-            _spoken_frame("$5"), "ctx1", "five dollars", append_to_context=True, text_aggregator=agg
-        )
-        await seq.register_spoken(
-            _spoken_frame(". Ok"), "ctx1", ". Ok", append_to_context=True, text_aggregator=agg
-        )
+        # tts differs from user-facing (a simulated transform): "$5" -> "five dollars".
+        for tts, txt in [("five dollars", "$5"), (".", "."), (" Ok", " Ok")]:
+            await seq.register_spoken(_spoken_frame(txt), "ctx1", tts, append_to_context=True)
         self.assertEqual(len(seq._slots), 1)
         slot = seq._slots[0]
-        self.assertEqual(slot.frame.text, "$5. Ok")  # user-facing text unaffected
+        self.assertEqual(slot.frame.text, "$5.")  # user-facing unaffected
         result = seq.process_word("five", pts=10, context_id="ctx1")
         word_frames = [f for f in result if isinstance(f, TTSTextFrame)]
         self.assertEqual(word_frames[0].text, "five")
 
     async def test_no_tracker_registers_each_token_immediately(self):
-        """streaming + build_tracker=False (push_text_frames=True) behaves like today: per-token slots."""
+        # streaming + build_tracker=False (push_text_frames=True): per-token slots.
         seq = _seq(streaming=True)
         await seq.register_spoken(
             _spoken_frame("Hi"), "ctx1", "Hi", append_to_context=True, build_tracker=False
@@ -1310,76 +1266,38 @@ class TestRegisterSpokenStreaming(unittest.IsolatedAsyncioTestCase):
 class TestRegisterSpokenBufferedWords(unittest.IsolatedAsyncioTestCase):
     async def test_word_for_pending_sentence_is_buffered(self):
         seq = _seq(streaming=True)
-        await seq.register_spoken(
-            _spoken_frame("Hi"),
-            "ctx1",
-            "Hi",
-            append_to_context=True,
-            text_aggregator=_sentence_aggregator(),
-        )
+        await _stream(seq, "ctx1", "Hi", " there")  # nothing promoted yet
         result = seq.process_word("Hi", pts=10, context_id="ctx1")
         self.assertEqual(result, [])
         self.assertEqual(len(seq._buffered_words), 1)
 
     async def test_buffered_word_replayed_once_boundary_confirmed(self):
         seq = _seq(streaming=True)
-        agg = _sentence_aggregator()
-        await seq.register_spoken(
-            _spoken_frame("Hi"), "ctx1", "Hi", append_to_context=True, text_aggregator=agg
-        )
-        await seq.register_spoken(
-            _spoken_frame("."), "ctx1", ".", append_to_context=True, text_aggregator=agg
-        )
-        # Word arrives before the sentence has promoted — buffered.
-        buffered_result = seq.process_word("Hi. Ok", pts=10, context_id="ctx1")
-        self.assertEqual(buffered_result, [])
-
-        # Trailing content resolves the lookahead and promotes the sentence;
-        # the buffered word should replay.
-        result = await seq.register_spoken(
-            _spoken_frame(" Ok"), "ctx1", " Ok", append_to_context=True, text_aggregator=agg
-        )
+        await _stream(seq, "ctx1", "Hi", " there", "!")  # pending, not promoted
+        # Word arrives before promotion -> buffered.
+        self.assertEqual(seq.process_word("Hi", pts=10, context_id="ctx1"), [])
+        # The next sentence's token promotes "Hi there!"; buffered word replays.
+        result = await _stream(seq, "ctx1", " How")
         word_frames = [f for f in result if isinstance(f, TTSTextFrame)]
-        self.assertEqual(len(word_frames), 1)
-        self.assertEqual(word_frames[0].text, "Hi. Ok")
-        self.assertEqual(seq._slots, [])
+        self.assertEqual([f.text for f in word_frames], ["Hi"])
 
     async def test_word_still_unmatched_after_one_promotion_is_rebuffered(self):
         seq = _seq(streaming=True)
-        agg = _sentence_aggregator()
-        await seq.register_spoken(
-            _spoken_frame("Hi"), "ctx1", "Hi", append_to_context=True, text_aggregator=agg
-        )
-        await seq.register_spoken(
-            _spoken_frame(". Ok"), "ctx1", ". Ok", append_to_context=True, text_aggregator=agg
-        )
-        self.assertEqual(len(seq._slots), 1)  # first sentence "Hi. Ok" promoted
-
-        # This word belongs to the *next* (not yet started) sentence.
-        result = seq.process_word("Bye", pts=5, context_id="ctx1")
-        self.assertEqual(result, [])
+        await _stream(seq, "ctx1", "Hi", " there", "!", " How")  # promotes "Hi there!"
+        self.assertEqual(len(seq._slots), 1)
+        # A word for the second (not-yet-promoted) sentence is buffered.
+        self.assertEqual(seq.process_word("How", pts=5, context_id="ctx1"), [])
         self.assertEqual(len(seq._buffered_words), 1)
-
-        # First sentence still completes normally via its own word.
-        seq.process_word("Hi. Ok", pts=10, context_id="ctx1")
+        # First sentence completes via its own words.
+        seq.process_word("Hi", pts=10, context_id="ctx1")
+        seq.process_word("there!", pts=20, context_id="ctx1")
         self.assertEqual(seq._slots, [])
-
-        # Second sentence promotes; the earlier buffered "Bye" now matches.
-        await seq.register_spoken(
-            _spoken_frame("Bye"),
-            "ctx1",
-            "Bye",
-            append_to_context=True,
-            text_aggregator=_sentence_aggregator(),
-        )
-        result = await seq.register_spoken(
-            _spoken_frame(". Sure"), "ctx1", ". Sure", append_to_context=True
-        )
+        # Second sentence promotes; the buffered "How" now matches.
+        result = await seq.finalize()
         word_frames = [f for f in result if isinstance(f, TTSTextFrame)]
-        self.assertTrue(any(f.text == "Bye" for f in word_frames))
+        self.assertTrue(any(f.text == "How" for f in word_frames))
 
     async def test_non_streaming_sequencer_keeps_passthrough_path(self):
-        """A non-streaming sequencer must not buffer — it keeps today's warning+passthrough."""
         seq = _seq(streaming=False)
         await seq.register_spoken(_spoken_frame("hello world"), "ctx1", "hello world", True)
         result = seq.process_word("zzz", pts=5, context_id="ctx1")
@@ -1389,23 +1307,16 @@ class TestRegisterSpokenBufferedWords(unittest.IsolatedAsyncioTestCase):
 
 
 # ---------------------------------------------------------------------------
-# register_skipped — forces finalize of a pending streamed sentence
+# register_skipped — finalizes a pending streamed sentence first
 # ---------------------------------------------------------------------------
 
 
 class TestRegisterSkippedForcesFinalize(unittest.IsolatedAsyncioTestCase):
     async def test_pending_sentence_promoted_before_skipped_slot(self):
         seq = _seq(streaming=True)
-        await seq.register_spoken(
-            _spoken_frame("Hi there"),
-            "ctx1",
-            "Hi there",
-            append_to_context=True,
-            text_aggregator=_sentence_aggregator(),
-        )
+        await _stream(seq, "ctx1", "Hi", " there")  # pending, no boundary
         skipped = _skipped_frame("code")
         await seq.register_skipped(skipped, "ctx2", None)
-
         self.assertEqual(len(seq._slots), 2)
         self.assertTrue(seq._slots[0].spoken)
         self.assertEqual(seq._slots[0].frame.text, "Hi there")
@@ -1421,18 +1332,12 @@ class TestRegisterSkippedForcesFinalize(unittest.IsolatedAsyncioTestCase):
 
     async def test_skipped_frame_stays_blocked_until_finalized_sentence_completes(self):
         seq = _seq(streaming=True)
-        await seq.register_spoken(
-            _spoken_frame("Hi there"),
-            "ctx1",
-            "Hi there",
-            append_to_context=True,
-            text_aggregator=_sentence_aggregator(),
-        )
+        await _stream(seq, "ctx1", "Hi", " there")
         skipped = _skipped_frame("code")
         result = await seq.register_skipped(skipped, "ctx1", None)
         self.assertEqual(result, [])
-
-        result = seq.process_word("Hi there", pts=10, context_id="ctx1")
+        result = seq.process_word("Hi", pts=10, context_id="ctx1")
+        result += seq.process_word("there", pts=20, context_id="ctx1")
         self.assertTrue(any(f is skipped for f in result))
 
 
@@ -1444,49 +1349,35 @@ class TestRegisterSkippedForcesFinalize(unittest.IsolatedAsyncioTestCase):
 class TestFinalizeEndOfTurn(unittest.IsolatedAsyncioTestCase):
     async def test_finalize_promotes_pending_sentence_with_no_terminal_punctuation(self):
         seq = _seq(streaming=True)
-        await seq.register_spoken(
-            _spoken_frame("Hi there"),
-            "ctx1",
-            "Hi there",
-            append_to_context=True,
-            text_aggregator=_sentence_aggregator(),
-        )
+        await _stream(seq, "ctx1", "Hi", " there")
         self.assertEqual(seq._slots, [])
-
-        result = seq.finalize()
+        result = await seq.finalize()
         self.assertEqual(result, [])
         self.assertEqual(len(seq._slots), 1)
         self.assertEqual(seq._slots[0].frame.text, "Hi there")
 
-    def test_finalize_with_nothing_pending_is_a_noop(self):
+    async def test_finalize_with_nothing_pending_is_a_noop(self):
         seq = _seq(streaming=True)
-        self.assertEqual(seq.finalize(), [])
+        self.assertEqual(await seq.finalize(), [])
         self.assertEqual(seq._slots, [])
+
+    async def test_finalize_on_non_streaming_is_a_noop(self):
+        seq = _seq(streaming=False)
+        self.assertEqual(await seq.finalize(), [])
 
     async def test_finalize_does_not_create_slot_for_whitespace_only_pending(self):
         seq = _seq(streaming=True)
-        await seq.register_spoken(
-            _spoken_frame(" "),
-            "ctx1",
-            " ",
-            append_to_context=True,
-            text_aggregator=_sentence_aggregator(),
-        )
-        result = seq.finalize()
+        await _stream(seq, "ctx1", "   ")
+        result = await seq.finalize()
         self.assertEqual(result, [])
         self.assertEqual(seq._slots, [])
 
     async def test_finalize_then_processing_words_drains_the_slot(self):
         seq = _seq(streaming=True)
-        await seq.register_spoken(
-            _spoken_frame("Hi there"),
-            "ctx1",
-            "Hi there",
-            append_to_context=True,
-            text_aggregator=_sentence_aggregator(),
-        )
-        seq.finalize()
-        seq.process_word("Hi there", pts=10, context_id="ctx1")
+        await _stream(seq, "ctx1", "Hi", " there")
+        await seq.finalize()
+        seq.process_word("Hi", pts=10, context_id="ctx1")
+        seq.process_word("there", pts=20, context_id="ctx1")
         self.assertEqual(seq._slots, [])
 
 
@@ -1496,28 +1387,17 @@ class TestFinalizeEndOfTurn(unittest.IsolatedAsyncioTestCase):
 
 
 class TestClearResetsStreamingState(unittest.IsolatedAsyncioTestCase):
-    async def test_clear_empties_pending(self):
+    async def test_clear_empties_pending_aggregator(self):
         seq = _seq(streaming=True)
-        await seq.register_spoken(
-            _spoken_frame("Hi"),
-            "ctx1",
-            "Hi",
-            append_to_context=True,
-            text_aggregator=_sentence_aggregator(),
-        )
-        self.assertEqual(len(seq._pending), 1)
+        await _stream(seq, "ctx1", "Hi", " there")
         seq.clear()
-        self.assertEqual(seq._pending, {})
+        # A fresh aggregator: finalize now yields nothing.
+        self.assertEqual(await seq.finalize(), [])
+        self.assertIsNone(seq._streaming_slot_meta)
 
     async def test_clear_empties_buffered_words(self):
         seq = _seq(streaming=True)
-        await seq.register_spoken(
-            _spoken_frame("Hi"),
-            "ctx1",
-            "Hi",
-            append_to_context=True,
-            text_aggregator=_sentence_aggregator(),
-        )
+        await _stream(seq, "ctx1", "Hi", " there")
         seq.process_word("Hi", pts=10, context_id="ctx1")  # buffered
         self.assertEqual(len(seq._buffered_words), 1)
         seq.clear()
@@ -1525,23 +1405,11 @@ class TestClearResetsStreamingState(unittest.IsolatedAsyncioTestCase):
 
     async def test_sequencer_behaves_fresh_after_clear(self):
         seq = _seq(streaming=True)
-        agg = _sentence_aggregator()
-        await seq.register_spoken(
-            _spoken_frame("Hi"), "ctx1", "Hi", append_to_context=True, text_aggregator=agg
-        )
+        await _stream(seq, "ctx1", "Hi")
         seq.clear()
-
-        # No leaked state — a fresh sentence accumulates and promotes normally.
-        await seq.register_spoken(
-            _spoken_frame("Bye"),
-            "ctx1",
-            "Bye",
-            append_to_context=True,
-            text_aggregator=_sentence_aggregator(),
-        )
-        await seq.register_spoken(_spoken_frame(". Ok"), "ctx1", ". Ok", append_to_context=True)
+        await _stream(seq, "ctx1", "Bye", "!", " Ok")
         self.assertEqual(len(seq._slots), 1)
-        self.assertEqual(seq._slots[0].frame.text, "Bye. Ok")
+        self.assertEqual(seq._slots[0].frame.text, "Bye!")
 
 
 if __name__ == "__main__":
