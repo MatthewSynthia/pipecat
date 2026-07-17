@@ -11,6 +11,7 @@ and process text tokens, typically used by TTS services to determine when
 aggregated text should be sent for speech synthesis.
 """
 
+import copy
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
@@ -85,6 +86,25 @@ class BaseTextAggregator(ABC):
             The aggregation type.
         """
         return self._aggregation_type
+
+    def clone(self, *, aggregation_type: AggregationType) -> "BaseTextAggregator":
+        """Return a shallow copy of this aggregator reconfigured for a different aggregation type.
+
+        Preserves whatever transient buffering state (e.g. in-progress tag
+        tracking) the original currently holds, since the copy is meant to
+        continue from exactly this point in the stream, just grouping
+        differently going forward.
+
+        Args:
+            aggregation_type: The aggregation type the clone should use.
+
+        Returns:
+            An independent aggregator instance, decoupled from further changes
+            to the original.
+        """
+        clone = copy.copy(self)
+        clone._aggregation_type = AggregationType(aggregation_type)
+        return clone
 
     @property
     @abstractmethod

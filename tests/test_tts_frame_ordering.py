@@ -40,6 +40,7 @@ import pytest
 
 from pipecat.frames.frames import (
     AggregatedTextFrame,
+    AggregatedTextProgressFrame,
     ControlFrame,
     DataFrame,
     Frame,
@@ -55,7 +56,7 @@ from pipecat.frames.frames import (
     TTSTextFrame,
     UninterruptibleFrame,
 )
-from pipecat.services.tts_service import TTSService
+from pipecat.services.tts_service import TextAggregationMode, TTSService
 from pipecat.tests.utils import SleepFrame, run_test
 from pipecat.utils.string import TextPartForConcatenation, concatenate_aggregated_text
 from pipecat.utils.text.base_text_aggregator import AggregationType
@@ -1057,6 +1058,63 @@ class _MockPerCallWordTimestampWSTTSService(TTSService):
             yield
 
 
+class _MockTokenStreamingWSTTSService(TTSService):
+    """WebSocket-style TOKEN-streaming TTS: one run_tts() call per token, all sharing
+    one audio context (mirrors ``_reuse_context_id_within_turn``).
+
+    Each call delivers its own word-timestamp event into the shared context but never
+    closes it — the context is only closed when flush_audio() is called, mirroring a
+    real provider's "continue: false" semantics, triggered by
+    TTSService.on_turn_context_completed() at end of turn.
+    """
+
+    def __init__(self, word_times_per_call: list[list[tuple[str, float]]], **kwargs):
+        super().__init__(
+            push_start_frame=True,
+            push_text_frames=False,
+            pause_frame_processing=False,
+            sample_rate=_SAMPLE_RATE,
+            **kwargs,
+        )
+        self._word_times_queue = list(word_times_per_call)
+
+    def can_generate_metrics(self) -> bool:
+        return False
+
+    async def run_tts(self, text: str, context_id: str) -> AsyncGenerator[Frame, None]:
+        word_times = self._word_times_queue.pop(0) if self._word_times_queue else []
+
+        async def _deliver():
+            await asyncio.sleep(0.01)
+            if word_times:
+                await self.add_word_timestamps(word_times, context_id=context_id)
+            await self.append_to_audio_context(
+                context_id,
+                TTSAudioRawFrame(
+                    audio=_FAKE_AUDIO,
+                    sample_rate=_SAMPLE_RATE,
+                    num_channels=1,
+                    context_id=context_id,
+                ),
+            )
+
+        self.create_task(_deliver(), name=f"mock_token_deliver_{context_id}")
+        if False:
+            yield
+
+    async def flush_audio(self, context_id: str | None = None):
+        ctx = context_id or self.get_active_audio_context_id()
+        if not ctx or not self.audio_context_available(ctx):
+            return
+
+        async def _close():
+            await asyncio.sleep(0.02)
+            await self.append_to_audio_context(ctx, TTSStoppedFrame(context_id=ctx))
+            await self.remove_audio_context(ctx)
+
+        self.create_task(_close(), name=f"mock_token_close_{ctx}")
+
+
 # ---------------------------------------------------------------------------
 # Tests: _force_complete_spoken_slots — TTSTextFrame emission for dropped timestamps
 # ---------------------------------------------------------------------------
@@ -1654,6 +1712,54 @@ async def test_tts_started_carries_append_to_context(service_factory, append_to_
     started = [f for f in frames_received[0] if isinstance(f, TTSStartedFrame)]
     assert len(started) == 1, f"Expected exactly one TTSStartedFrame, got {len(started)}"
     assert started[0].append_to_context is append_to_context
+
+
+@pytest.mark.asyncio
+async def test_token_mode_progress_grows_across_whole_sentence():
+    """TextAggregationMode.TOKEN must report progress across the whole sentence.
+
+    Regression: in TOKEN mode, every streamed token used to register its own
+    single-token WordCompletionTracker, so AggregatedTextProgressFrame always
+    reported a degenerate one-word accumulated_text with remaining_text always
+    empty. The sequencer now groups streamed tokens back into a sentence
+    internally, so progress should grow across the whole sentence exactly like
+    SENTENCE mode already does.
+
+    Two tokens ("Hello" and " there.") are streamed individually — each gets
+    its own run_tts() call and its own word-timestamp event delivered to the
+    shared audio context — but should be tracked as one combined sentence.
+    """
+    tts = _MockTokenStreamingWSTTSService(
+        word_times_per_call=[[("Hello", 0.0)], [("there.", 0.2)]],
+        text_aggregation_mode=TextAggregationMode.TOKEN,
+    )
+    frames_to_send = [
+        LLMFullResponseStartFrame(),
+        TextFrame(text="Hello"),
+        TextFrame(text=" there."),
+        LLMFullResponseEndFrame(),
+    ]
+    frames_received = await run_test(tts, frames_to_send=frames_to_send)
+    down = frames_received[0]
+
+    progress_frames = [f for f in down if isinstance(f, AggregatedTextProgressFrame)]
+    assert len(progress_frames) == 2, (
+        f"Expected 2 AggregatedTextProgressFrame, got {len(progress_frames)}"
+    )
+
+    # Both progress events belong to the SAME combined sentence segment, not
+    # two separate single-token segments.
+    segment_ids = {f.segment_id for f in progress_frames}
+    assert len(segment_ids) == 1, (
+        f"Expected both progress frames to share one segment_id, got {segment_ids}"
+    )
+
+    # accumulated_text grows across the whole sentence rather than resetting
+    # per token, and remaining_text shrinks accordingly.
+    assert progress_frames[0].accumulated_text == "Hello"
+    assert progress_frames[0].remaining_text == " there."
+    assert progress_frames[1].accumulated_text == "Hello there."
+    assert progress_frames[1].remaining_text == ""
 
 
 if __name__ == "__main__":

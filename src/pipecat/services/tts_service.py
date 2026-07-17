@@ -51,7 +51,6 @@ from pipecat.services.settings import TTSSettings, is_given
 from pipecat.services.websocket_service import WebsocketService
 from pipecat.transcriptions.language import Language
 from pipecat.utils.context.aggregated_frame_sequencer import AggregatedFrameSequencer
-from pipecat.utils.context.word_completion_tracker import WordCompletionTracker
 from pipecat.utils.deprecation import deprecated
 from pipecat.utils.frame_queue import FrameQueue
 from pipecat.utils.text.base_text_filter import BaseTextFilter
@@ -303,7 +302,9 @@ class TTSService(AIService):
         # Tracks all AggregatedTextFrame slots (spoken and skipped) in order.
         # Skipped frames are held until preceding spoken slots complete, ensuring
         # append_to_context=True reaches the assistant aggregator in the right order.
-        self._aggregated_frame_sequencer = AggregatedFrameSequencer(name=str(self))
+        self._aggregated_frame_sequencer = AggregatedFrameSequencer(
+            name=str(self), streaming=self._is_streaming_tokens
+        )
 
         self._resampler = create_stream_resampler()
 
@@ -724,6 +725,12 @@ class TTSService(AIService):
                     )
                 )
 
+            # Force-promote any sentence still pending in the sequencer (streaming
+            # mode only; a no-op otherwise) — handles a response that ends with no
+            # terminal punctuation.
+            for f in self._aggregated_frame_sequencer.finalize():
+                await self.push_frame(f)
+
             # We pause processing incoming frames if the LLM response included
             # text (it might be that it's only a function calling response). We
             # pause to avoid audio overlapping.
@@ -1105,19 +1112,20 @@ class TTSService(AIService):
         # Register this spoken frame so the sequencer can track its completion
         # and unblock any skipped frames queued behind it. Word-timestamp services
         # complete the slot via process_word; push_text_frames services complete it
-        # below after the TTSTextFrame is appended to the audio context.
-        self._aggregated_frame_sequencer.register_spoken(
+        # below after the TTSTextFrame is appended to the audio context. When
+        # streaming tokens, the sequencer accumulates this call's text into a
+        # pending sentence internally and only registers a real slot once a
+        # sentence boundary is detected.
+        for f in await self._aggregated_frame_sequencer.register_spoken(
             src_frame,
             context_id,
-            tracker=WordCompletionTracker(
-                prepared_text,
-                llm_text=src_frame.raw_text or src_frame.text,
-                user_facing_text=src_frame.text,
-            )
-            if not self._push_text_frames
-            else None,
+            prepared_text,
             append_to_context=self._tts_contexts[context_id].append_to_context,
-        )
+            build_tracker=not self._push_text_frames,
+            text_aggregator=self._text_aggregator,
+            includes_inter_frame_spaces=bool(includes_inter_frame_spaces),
+        ):
+            await self.push_frame(f)
 
         await self.tts_process_generator(context_id, self.run_tts(prepared_text, context_id))
 
