@@ -372,6 +372,7 @@ SERVICE_CONFIGS = {
         "        ),\n"
         "    )\n"
     ),
+    "deepgram_flux_tts": 'DeepgramFluxTTSService(api_key=os.getenv("DEEPGRAM_API_KEY"))',
     "deepgram_sagemaker_tts": (
         "DeepgramSageMakerTTSService(\n"
         '        endpoint_name=os.getenv("DEEPGRAM_SAGEMAKER_TTS_ENDPOINT_NAME"),\n'
