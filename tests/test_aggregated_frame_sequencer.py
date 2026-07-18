@@ -36,8 +36,6 @@ from pipecat.frames.frames import (
 )
 from pipecat.utils.context.aggregated_frame_sequencer import AggregatedFrameSequencer
 from pipecat.utils.string import TextPartForConcatenation, concatenate_aggregated_text
-from pipecat.utils.text.simple_text_aggregator import SimpleTextAggregator
-from pipecat.utils.text.skip_tags_aggregator import SkipTagsAggregator
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -54,10 +52,6 @@ def _spoken_frame(text: str, raw_text: str | None = None) -> AggregatedTextFrame
 
 def _skipped_frame(text: str) -> AggregatedTextFrame:
     return AggregatedTextFrame(text, "code")
-
-
-def _sentence_aggregator() -> SimpleTextAggregator:
-    return SimpleTextAggregator(aggregation_type=AggregationType.TOKEN)
 
 
 # ---------------------------------------------------------------------------
@@ -1335,7 +1329,9 @@ class TestRegisterSkippedForcesFinalize(unittest.IsolatedAsyncioTestCase):
         await _stream(seq, "ctx1", "Hi", " there")
         skipped = _skipped_frame("code")
         result = await seq.register_skipped(skipped, "ctx1", None)
-        self.assertEqual(result, [])
+        # The forced finalize emits the sentence frame, but the skipped frame
+        # stays blocked behind the not-yet-spoken sentence slot.
+        self.assertFalse(any(f is skipped for f in result))
         result = seq.process_word("Hi", pts=10, context_id="ctx1")
         result += seq.process_word("there", pts=20, context_id="ctx1")
         self.assertTrue(any(f is skipped for f in result))
@@ -1352,7 +1348,11 @@ class TestFinalizeEndOfTurn(unittest.IsolatedAsyncioTestCase):
         await _stream(seq, "ctx1", "Hi", " there")
         self.assertEqual(seq._slots, [])
         result = await seq.finalize()
-        self.assertEqual(result, [])
+        # The promoted sentence frame is emitted (the "new" announcement).
+        self.assertEqual(len(result), 1)
+        self.assertIsInstance(result[0], AggregatedTextFrame)
+        self.assertEqual(result[0].text, "Hi there")
+        self.assertTrue(result[0].will_be_spoken)
         self.assertEqual(len(seq._slots), 1)
         self.assertEqual(seq._slots[0].frame.text, "Hi there")
 

@@ -476,10 +476,18 @@ class AggregatedFrameSequencer:
     def _promote(self, agg: ParallelAggregation) -> list[Frame]:
         """Turn a completed parallel-aggregated sentence into a real spoken slot.
 
-        Builds the real WordCompletionTracker and a synthetic AggregatedTextFrame
-        to carry progress-frame metadata (never itself pushed downstream) from the
-        three aggregated text channels, appends the slot using the last streamed
-        slot metadata, then replays any words that were buffered waiting for it.
+        Builds the real WordCompletionTracker and an ``AggregationType.SENTENCE``
+        AggregatedTextFrame from the three aggregated text channels, appends the
+        slot using the last streamed slot metadata, then replays any words that
+        were buffered waiting for it.
+
+        The sentence frame is **emitted downstream** (first in the returned list)
+        with ``will_be_spoken=True``: it is the streaming-mode equivalent of the
+        pre-synthesis sentence frame that SENTENCE mode pushes, giving RTVI clients
+        the initial ``spoken_status="new"`` event whose ``segment_id`` the
+        subsequent progress frames (built from this same frame's id) reference.
+        ``append_to_context`` is False on it — the conversation context is built
+        from the per-word TTSTextFrames, not this announcement.
 
         The slot's ``includes_inter_frame_spaces`` is left False: for a streamed
         (TOKEN-mode) sentence, per-word CJK spacing is stamped by
@@ -487,8 +495,9 @@ class AggregatedFrameSequencer:
         LLM token's own inter-frame-space flag.
 
         Returns:
-            Frames unblocked by replaying previously-buffered words. Empty if the
-            aggregated text is entirely whitespace, or no slot metadata is set.
+            The sentence frame followed by any frames unblocked by replaying
+            previously-buffered words. Empty if the aggregated text is entirely
+            whitespace, or no slot metadata is set.
         """
         if not agg.user_facing_text.strip() or self._streaming_slot_meta is None:
             return []
@@ -497,11 +506,14 @@ class AggregatedFrameSequencer:
         frame = AggregatedTextFrame(
             agg.user_facing_text, AggregationType.SENTENCE, raw_text=agg.llm_text or None
         )
+        frame.context_id = context_id
+        frame.will_be_spoken = True
+        frame.append_to_context = False
         tracker = WordCompletionTracker(
             agg.tts_text, llm_text=agg.llm_text or None, user_facing_text=agg.user_facing_text
         )
         self._append_spoken_slot(frame, context_id, tracker, append_to_context, False)
-        return self._drain_buffered_words()
+        return [frame, *self._drain_buffered_words()]
 
     def _drain_buffered_words(self) -> list[Frame]:
         """Replay previously-buffered word events now that a new slot may match them.

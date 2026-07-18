@@ -1715,51 +1715,75 @@ async def test_tts_started_carries_append_to_context(service_factory, append_to_
 
 
 @pytest.mark.asyncio
-async def test_token_mode_progress_grows_across_whole_sentence():
-    """TextAggregationMode.TOKEN must report progress across the whole sentence.
+async def test_token_mode_progress_and_context_across_whole_sentence():
+    """TextAggregationMode.TOKEN must track the whole sentence for progress and context.
 
-    Regression: in TOKEN mode, every streamed token used to register its own
-    single-token WordCompletionTracker, so AggregatedTextProgressFrame always
-    reported a degenerate one-word accumulated_text with remaining_text always
-    empty. The sequencer now groups streamed tokens back into a sentence
-    internally, so progress should grow across the whole sentence exactly like
-    SENTENCE mode already does.
+    Two regressions this guards:
 
-    Two tokens ("Hello" and " there.") are streamed individually — each gets
-    its own run_tts() call and its own word-timestamp event delivered to the
-    shared audio context — but should be tracked as one combined sentence.
+    1. Progress: every streamed token used to register its own single-token
+       WordCompletionTracker, so AggregatedTextProgressFrame reported a degenerate
+       one-word accumulated_text. The sequencer now groups tokens back into a
+       sentence, so progress grows across the whole sentence, and a single
+       ``AggregationType.SENTENCE`` frame (``will_be_spoken=True``) is emitted as
+       the anchor the progress frames' ``segment_id`` references.
+
+    2. Context: the per-word TTSTextFrames were stamped
+       ``includes_inter_frame_spaces=True`` (inherited from the LLM token flag),
+       so the assistant context assembled with no spaces ("Hithere."). They must
+       carry False so the context aggregator re-inserts spaces ("Hi there.").
+
+    Two tokens ("Hi", " there.") are streamed individually — each gets its own
+    run_tts() call and word-timestamp event — but are tracked as one sentence.
     """
     tts = _MockTokenStreamingWSTTSService(
-        word_times_per_call=[[("Hello", 0.0)], [("there.", 0.2)]],
+        word_times_per_call=[[("Hi", 0.0)], [("there.", 0.2)]],
         text_aggregation_mode=TextAggregationMode.TOKEN,
     )
     frames_to_send = [
         LLMFullResponseStartFrame(),
-        TextFrame(text="Hello"),
+        TextFrame(text="Hi"),
         TextFrame(text=" there."),
         LLMFullResponseEndFrame(),
     ]
     frames_received = await run_test(tts, frames_to_send=frames_to_send)
     down = frames_received[0]
 
+    # --- Progress across the whole sentence, one shared segment ---
     progress_frames = [f for f in down if isinstance(f, AggregatedTextProgressFrame)]
     assert len(progress_frames) == 2, (
         f"Expected 2 AggregatedTextProgressFrame, got {len(progress_frames)}"
     )
-
-    # Both progress events belong to the SAME combined sentence segment, not
-    # two separate single-token segments.
     segment_ids = {f.segment_id for f in progress_frames}
     assert len(segment_ids) == 1, (
         f"Expected both progress frames to share one segment_id, got {segment_ids}"
     )
-
-    # accumulated_text grows across the whole sentence rather than resetting
-    # per token, and remaining_text shrinks accordingly.
-    assert progress_frames[0].accumulated_text == "Hello"
+    assert progress_frames[0].accumulated_text == "Hi"
     assert progress_frames[0].remaining_text == " there."
-    assert progress_frames[1].accumulated_text == "Hello there."
+    assert progress_frames[1].accumulated_text == "Hi there."
     assert progress_frames[1].remaining_text == ""
+
+    # --- The anchor: one SENTENCE AggregatedTextFrame, will_be_spoken, matching id ---
+    sentence_frames = [
+        f
+        for f in down
+        if type(f) is AggregatedTextFrame and f.aggregated_by == AggregationType.SENTENCE
+    ]
+    assert len(sentence_frames) == 1, (
+        f"Expected 1 SENTENCE AggregatedTextFrame anchor, got {len(sentence_frames)}"
+    )
+    assert sentence_frames[0].text == "Hi there."
+    assert sentence_frames[0].will_be_spoken
+    assert sentence_frames[0].id == next(iter(segment_ids))
+
+    # --- Assistant context assembled from the word frames keeps correct spacing ---
+    context_frames = [f for f in down if isinstance(f, TTSTextFrame) and f.append_to_context]
+    parts = [
+        TextPartForConcatenation(f.text, includes_inter_part_spaces=f.includes_inter_frame_spaces)
+        for f in context_frames
+    ]
+    assert concatenate_aggregated_text(parts) == "Hi there.", (
+        f"Assistant context must keep spaces; got {concatenate_aggregated_text(parts)!r}"
+    )
 
 
 if __name__ == "__main__":
