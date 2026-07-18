@@ -34,7 +34,10 @@ from pipecat.frames.frames import (
     AggregationType,
     TTSTextFrame,
 )
-from pipecat.utils.context.aggregated_frame_sequencer import AggregatedFrameSequencer
+from pipecat.utils.context.aggregated_frame_sequencer import (
+    AggregatedFrameSequencer,
+    _ParallelSentenceAggregator,
+)
 from pipecat.utils.string import TextPartForConcatenation, concatenate_aggregated_text
 
 # ---------------------------------------------------------------------------
@@ -1151,10 +1154,10 @@ class TestVoiceFormattingTransforms(unittest.IsolatedAsyncioTestCase):
 # ---------------------------------------------------------------------------
 # register_spoken — streaming (TOKEN mode): token-by-token sentence accumulation
 #
-# In streaming mode the sequencer owns a ParallelTextAggregator; register_spoken
-# is called once per token and only registers a real slot once a sentence
-# boundary is confirmed (which happens when the NEXT sentence's first token
-# arrives, or via finalize() at end of turn).
+# In streaming mode the sequencer owns a _ParallelSentenceAggregator;
+# register_spoken is called once per token and only registers a real slot once a
+# sentence boundary is confirmed (which happens when the NEXT sentence's first
+# token arrives, or via finalize() at end of turn).
 # ---------------------------------------------------------------------------
 
 
@@ -1410,6 +1413,97 @@ class TestClearResetsStreamingState(unittest.IsolatedAsyncioTestCase):
         await _stream(seq, "ctx1", "Bye", "!", " Ok")
         self.assertEqual(len(seq._slots), 1)
         self.assertEqual(seq._slots[0].frame.text, "Bye!")
+
+
+# ---------------------------------------------------------------------------
+# _ParallelSentenceAggregator — the sequencer's internal token→sentence grouper
+#
+# Emits a sentence only once the NEXT sentence's first token supplies the
+# lookahead (no over-grouping), and keeps the three channels token-aligned.
+# ---------------------------------------------------------------------------
+
+
+async def _agg_feed(agg, *tokens):
+    """Feed same-text tokens through the aggregator, collecting emitted sentences.
+
+    Each token is used for all three channels. Returns the list of
+    (tts, llm, user) tuples emitted across the whole run.
+    """
+    out = []
+    for t in tokens:
+        async for s in agg.aggregate(t, t, t):
+            out.append((s.tts_text, s.llm_text, s.user_facing_text))
+    return out
+
+
+class TestParallelSentenceAggregator(unittest.IsolatedAsyncioTestCase):
+    async def test_no_boundary_yields_nothing(self):
+        agg = _ParallelSentenceAggregator()
+        self.assertEqual(await _agg_feed(agg, "Hi", " there"), [])
+
+    async def test_terminal_token_alone_does_not_emit(self):
+        # A sentence-ending token needs lookahead (the next sentence's first
+        # token) before it is confirmed, so "!" alone emits nothing.
+        agg = _ParallelSentenceAggregator()
+        self.assertEqual(await _agg_feed(agg, "Hi", " there", "!"), [])
+
+    async def test_next_sentence_token_confirms_first_sentence_only(self):
+        # The lookahead token (" How") confirms "Hi there!" — but must NOT be
+        # folded into it (that was the over-grouping bug that broke progress).
+        agg = _ParallelSentenceAggregator()
+        out = await _agg_feed(agg, "Hi", " there", "!", " How")
+        self.assertEqual([e[0] for e in out], ["Hi there!"])
+
+    async def test_multi_sentence_stream_yields_each_cleanly(self):
+        agg = _ParallelSentenceAggregator()
+        emitted = await _agg_feed(agg, "Hi", " there", "!", " How", " are", " you", "?")
+        # Only the first sentence is confirmed mid-stream; the second waits.
+        self.assertEqual([e[0] for e in emitted], ["Hi there!"])
+        # The trailing sentence comes out on flush.
+        f = await agg.flush()
+        self.assertIsNotNone(f)
+        self.assertEqual(f.tts_text, " How are you?")
+
+    async def test_flush_emits_trailing_partial_sentence(self):
+        agg = _ParallelSentenceAggregator()
+        await _agg_feed(agg, "Just", " a", " fragment")
+        f = await agg.flush()
+        self.assertIsNotNone(f)
+        self.assertEqual(f.user_facing_text, "Just a fragment")
+
+    async def test_flush_returns_none_when_empty(self):
+        self.assertIsNone(await _ParallelSentenceAggregator().flush())
+
+    async def test_flush_returns_none_for_whitespace_only(self):
+        agg = _ParallelSentenceAggregator()
+        await _agg_feed(agg, "   ")
+        self.assertIsNone(await agg.flush())
+
+    async def test_handle_interruption_resets(self):
+        agg = _ParallelSentenceAggregator()
+        await _agg_feed(agg, "Hi", " there")
+        await agg.handle_interruption()
+        self.assertIsNone(await agg.flush())
+        # Behaves fresh afterwards.
+        out = await _agg_feed(agg, "Bye", "!", " Next")
+        self.assertEqual([e[0] for e in out], ["Bye!"])
+
+    async def test_channels_stay_token_aligned_under_transform(self):
+        # tts_text differs from user-facing/llm (a simulated transform), but
+        # because emission is token-aligned (whole tokens only), the three
+        # channels correspond to the same sentence span.
+        agg = _ParallelSentenceAggregator()
+        out = []
+        # (tts, llm, user) per token: "$5" is spoken as "five dollars".
+        triples = [
+            ("five dollars", "$5", "$5"),
+            (".", ".", "."),
+            (" Thanks", " Thanks", " Thanks"),
+        ]
+        for tts, llm, user in triples:
+            async for s in agg.aggregate(tts, llm, user):
+                out.append((s.tts_text, s.llm_text, s.user_facing_text))
+        self.assertEqual(out, [("five dollars.", "$5.", "$5.")])
 
 
 if __name__ == "__main__":

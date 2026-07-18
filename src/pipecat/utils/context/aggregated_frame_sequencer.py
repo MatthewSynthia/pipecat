@@ -6,6 +6,7 @@
 
 """Ordered sequencer for AggregatedTextFrame slots through TTS processing."""
 
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
 from loguru import logger
@@ -18,10 +19,105 @@ from pipecat.frames.frames import (
     TTSTextFrame,
 )
 from pipecat.utils.context.word_completion_tracker import WordCompletionTracker
-from pipecat.utils.text.parallel_text_aggregator import (
-    ParallelAggregation,
-    ParallelTextAggregator,
-)
+from pipecat.utils.text.simple_text_aggregator import SimpleTextAggregator
+
+
+@dataclass
+class _ParallelAggregation:
+    """One completed sentence, in each of the sequencer's three parallel channels.
+
+    Parameters:
+        tts_text: The sentence as sent to the TTS service (post-filter/transform).
+        llm_text: The sentence in the original LLM text (with any pattern delimiters).
+        user_facing_text: The sentence as shown to the user (no TTS tags/transforms).
+    """
+
+    tts_text: str
+    llm_text: str
+    user_facing_text: str
+
+
+class _ParallelSentenceAggregator:
+    """Internal: groups streamed tokens back into sentences for the sequencer.
+
+    Used by :class:`AggregatedFrameSequencer` when a TTS service streams tokens
+    individually (``TextAggregationMode.TOKEN``) but still needs whole-sentence
+    units for word-timestamp tracking and RTVI progress. Each token contributes
+    one part to each of the three channels (tts / llm / user-facing); sentence
+    completion is driven by the **TTS text** and completes all three together.
+
+    Boundary timing: a sentence-ending boundary is only *confirmed* by lookahead —
+    the first non-whitespace character of the *next* sentence, which arrives as
+    the next token. So the token that makes the underlying
+    :class:`SimpleTextAggregator` yield "Hi there!" is " I'm" (the next sentence's
+    first token). This aggregator therefore emits the text accumulated **before**
+    that triggering token and lets the triggering token begin the next sentence's
+    buffer. Because LLMs emit punctuation as its own token and the following word
+    as the next token, this slices cleanly at token boundaries and never inside a
+    token, so the three channels stay aligned even when a transform makes them
+    differ in length.
+    """
+
+    def __init__(self):
+        """Initialize the aggregator with empty channels."""
+        # A plain SENTENCE-mode aggregator drives boundary detection on the TTS
+        # text. The TTS text is already post-transform, so tag/pattern-aware
+        # boundary rules are not needed here.
+        self._aggregator = SimpleTextAggregator(aggregation_type=AggregationType.SENTENCE)
+        self._reset()
+
+    def _reset(self):
+        # Tokens accumulated since the last emitted sentence, per channel.
+        self._tts = ""
+        self._llm = ""
+        self._user = ""
+
+    async def aggregate(
+        self, tts_text: str, llm_text: str, user_facing_text: str
+    ) -> AsyncIterator[_ParallelAggregation]:
+        """Feed one token (all three channels) and yield any completed sentence.
+
+        Args:
+            tts_text: The token as sent to the TTS service.
+            llm_text: The token in the original LLM text.
+            user_facing_text: The token as shown to the user.
+
+        Yields:
+            A :class:`_ParallelAggregation` for each sentence completed by this
+            token (at most one). The yielded sentence is the text accumulated
+            *before* this token; this token starts the next sentence's buffer.
+        """
+        boundary = False
+        async for _ in self._aggregator.aggregate(tts_text):
+            boundary = True
+
+        if boundary and self._tts:
+            yield _ParallelAggregation(self._tts, self._llm, self._user)
+            self._tts = self._llm = self._user = ""
+
+        # Plain concatenation: LLM tokens already carry their own spacing.
+        self._tts += tts_text
+        self._llm += llm_text
+        self._user += user_facing_text
+
+    async def flush(self) -> _ParallelAggregation | None:
+        """Emit any trailing partial sentence at end of turn.
+
+        Returns:
+            A :class:`_ParallelAggregation` for the accumulated-but-unemitted text,
+            or ``None`` when nothing substantive is buffered.
+        """
+        await self._aggregator.flush()
+        if self._user.strip():
+            result = _ParallelAggregation(self._tts, self._llm, self._user)
+            self._reset()
+            return result
+        return None
+
+    async def handle_interruption(self):
+        """Discard all buffered text (called on interruption/reset)."""
+        await self._aggregator.handle_interruption()
+        self._reset()
 
 
 @dataclass
@@ -55,7 +151,7 @@ class AggregatedFrameSequencer:
     downstream, making the sequencer easily testable. The exceptions are
     :meth:`register_spoken`, :meth:`register_skipped`, and :meth:`finalize`, which
     are async because — when the sequencer is built with ``streaming=True`` — they
-    drive an async :class:`ParallelTextAggregator` to group streamed tokens into
+    drive an async :class:`_ParallelSentenceAggregator` to group streamed tokens into
     sentences.
 
     Example::
@@ -74,7 +170,7 @@ class AggregatedFrameSequencer:
             streaming: True when tokens are dispatched to the TTS individually
                 (``TextAggregationMode.TOKEN``). Each :meth:`register_spoken` call
                 then represents one token rather than a complete unit, so tokens
-                are fed to a :class:`ParallelTextAggregator` and only turned into a
+                are fed to a :class:`_ParallelSentenceAggregator` and only turned into a
                 real slot once a sentence boundary is detected (or forced via
                 :meth:`register_skipped`/:meth:`finalize`). Fixed for the life of
                 the sequencer — a TTS service's aggregation mode never changes at
@@ -82,7 +178,7 @@ class AggregatedFrameSequencer:
         """
         self._name = name
         self._streaming = streaming
-        self._parallel_text_aggregator = ParallelTextAggregator() if streaming else None
+        self._parallel = _ParallelSentenceAggregator() if streaming else None
         # context_id + append_to_context of the most recent streamed token,
         # used as slot metadata when a sentence built from earlier tokens is
         # promoted (turn-constant, so the latest values are correct).
@@ -113,7 +209,7 @@ class AggregatedFrameSequencer:
         When the sequencer is non-streaming, or streaming without a tracker
         (push_text_frames=True providers), this registers a slot immediately. When
         streaming with a tracker, the call instead feeds this token to the
-        :class:`ParallelTextAggregator` and only registers a real slot once a
+        :class:`_ParallelSentenceAggregator` and only registers a real slot once a
         sentence boundary is confirmed there.
 
         Args:
@@ -153,10 +249,10 @@ class AggregatedFrameSequencer:
             )
             return []
 
-        assert self._parallel_text_aggregator is not None
+        assert self._parallel is not None
         self._streaming_slot_meta = (context_id, append_to_context)
         frames: list[Frame] = []
-        async for agg in self._parallel_text_aggregator.aggregate(
+        async for agg in self._parallel.aggregate(
             tts_text, frame.raw_text or frame.text, frame.text
         ):
             frames.extend(self._promote(agg))
@@ -211,9 +307,9 @@ class AggregatedFrameSequencer:
             Frames unblocked by finalizing (e.g. buffered words that can now
             be replayed against the newly-registered slot).
         """
-        if self._parallel_text_aggregator is None:
+        if self._parallel is None:
             return []
-        agg = await self._parallel_text_aggregator.flush()
+        agg = await self._parallel.flush()
         return self._promote(agg) if agg else []
 
     def process_word(
@@ -443,7 +539,7 @@ class AggregatedFrameSequencer:
         self._buffered_words.clear()
         self._streaming_slot_meta = None
         # Re-create the aggregator for a clean state (sync; avoids an async reset).
-        self._parallel_text_aggregator = ParallelTextAggregator() if self._streaming else None
+        self._parallel = _ParallelSentenceAggregator() if self._streaming else None
 
     # -------------------------------------------------------------------------
     # Internal helpers
@@ -473,7 +569,7 @@ class AggregatedFrameSequencer:
             )
         )
 
-    def _promote(self, agg: ParallelAggregation) -> list[Frame]:
+    def _promote(self, agg: _ParallelAggregation) -> list[Frame]:
         """Turn a completed parallel-aggregated sentence into a real spoken slot.
 
         Builds the real WordCompletionTracker and an ``AggregationType.SENTENCE``
